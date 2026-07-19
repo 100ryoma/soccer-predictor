@@ -4,10 +4,7 @@ import streamlit as st
 from google import genai
 from google.genai import errors, types
 
-MODEL_OPTIONS = {
-    "Gemini 3.5 Flash（推奨・無料枠あり）": "gemini-3.5-flash",
-    "Gemini 3.1 Flash-Lite（より軽量・低コスト）": "gemini-3.1-flash-lite",
-}
+MODEL = "gemini-3.5-flash"
 
 SYSTEM_PROMPT = """あなたはサッカーの試合分析に精通したアナリストです。
 ユーザーから試合の途中経過を示す画像（スコア、経過時間、攻撃回数、危険な攻撃、\
@@ -111,11 +108,6 @@ def main():
         )
         return
 
-    with st.sidebar:
-        st.header("設定")
-        model_label = st.selectbox("使用モデル", list(MODEL_OPTIONS.keys()))
-        model = MODEL_OPTIONS[model_label]
-
     uploaded_files = st.file_uploader(
         "試合のライブスタッツ画像をアップロード（複数枚可）",
         type=["png", "jpg", "jpeg"],
@@ -134,7 +126,7 @@ def main():
 
         with st.spinner("AIが試合を分析中..."):
             try:
-                result = run_prediction(api_key, model, uploaded_files)
+                result = run_prediction(api_key, MODEL, uploaded_files)
             except errors.APIError as e:
                 st.error(f"API呼び出しでエラーが発生しました: {e.code} {e.message}")
                 return
