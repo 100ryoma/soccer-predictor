@@ -5,7 +5,7 @@ import streamlit as st
 from google import genai
 from google.genai import errors, types
 
-MODEL = "gemini-3.5-flash"
+MODEL_CHAIN = ["gemini-3.5-flash", "gemini-3.1-flash-lite"]
 RETRYABLE_STATUS_CODES = {429, 503}
 MAX_RETRIES = 3
 
@@ -75,7 +75,7 @@ def image_to_part(uploaded_file) -> types.Part:
     return types.Part.from_bytes(data=data, mime_type=mime_type)
 
 
-def run_prediction(api_key: str, model: str, images) -> str:
+def run_prediction(api_key: str, images) -> str:
     client = genai.Client(api_key=api_key)
 
     contents = [image_to_part(f) for f in images]
@@ -86,17 +86,24 @@ def run_prediction(api_key: str, model: str, images) -> str:
         max_output_tokens=4096,
     )
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = client.models.generate_content(
-                model=model, contents=contents, config=config
-            )
-            return response.text
-        except errors.APIError as e:
-            is_last_attempt = attempt == MAX_RETRIES - 1
-            if e.code not in RETRYABLE_STATUS_CODES or is_last_attempt:
-                raise
-            time.sleep(2**attempt)  # 1秒→2秒→4秒待ってリトライ
+    last_error = None
+    for model in MODEL_CHAIN:
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = client.models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+                return response.text
+            except errors.APIError as e:
+                last_error = e
+                is_last_attempt = attempt == MAX_RETRIES - 1
+                if e.code not in RETRYABLE_STATUS_CODES:
+                    raise
+                if not is_last_attempt:
+                    time.sleep(2**attempt)  # 1秒→2秒→4秒待ってリトライ
+                # 最後の試行でも混雑していたら、次のモデルに切り替える
+
+    raise last_error
 
 
 def main():
@@ -135,7 +142,7 @@ def main():
 
         with st.spinner("AIが試合を分析中..."):
             try:
-                result = run_prediction(api_key, MODEL, uploaded_files)
+                result = run_prediction(api_key, uploaded_files)
             except errors.APIError as e:
                 if e.code in RETRYABLE_STATUS_CODES:
                     st.error("AIが混み合っています。少し時間をおいてから、もう一度お試しください。")
