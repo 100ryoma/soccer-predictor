@@ -1,10 +1,13 @@
 import os
+import time
 
 import streamlit as st
 from google import genai
 from google.genai import errors, types
 
 MODEL = "gemini-3.5-flash"
+RETRYABLE_STATUS_CODES = {429, 503}
+MAX_RETRIES = 3
 
 SYSTEM_PROMPT = """あなたはサッカーの試合分析に精通したアナリストです。
 ユーザーから試合の途中経過を示す画像（スコア、経過時間、攻撃回数、危険な攻撃、\
@@ -78,16 +81,22 @@ def run_prediction(api_key: str, model: str, images) -> str:
     contents = [image_to_part(f) for f in images]
     contents.append(USER_PROMPT)
 
-    response = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            max_output_tokens=4096,
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        max_output_tokens=4096,
     )
 
-    return response.text
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.models.generate_content(
+                model=model, contents=contents, config=config
+            )
+            return response.text
+        except errors.APIError as e:
+            is_last_attempt = attempt == MAX_RETRIES - 1
+            if e.code not in RETRYABLE_STATUS_CODES or is_last_attempt:
+                raise
+            time.sleep(2**attempt)  # 1秒→2秒→4秒待ってリトライ
 
 
 def main():
@@ -128,7 +137,10 @@ def main():
             try:
                 result = run_prediction(api_key, MODEL, uploaded_files)
             except errors.APIError as e:
-                st.error(f"API呼び出しでエラーが発生しました: {e.code} {e.message}")
+                if e.code in RETRYABLE_STATUS_CODES:
+                    st.error("AIが混み合っています。少し時間をおいてから、もう一度お試しください。")
+                else:
+                    st.error(f"API呼び出しでエラーが発生しました: {e.code} {e.message}")
                 return
 
         st.markdown("---")
