@@ -5,13 +5,9 @@ import streamlit as st
 from google import genai
 from google.genai import errors, types
 
-MODEL_CHAIN = [
-    "gemini-3.5-flash",
-    "gemini-3.1-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-]
+MODEL_CHAIN = ["gemini-3.5-flash", "gemini-3.1-flash-lite"]
 RETRYABLE_STATUS_CODES = {429, 503}
+MODEL_UNAVAILABLE_CODES = {404}
 MAX_RETRIES = 3
 
 SYSTEM_PROMPT = """あなたはサッカーの試合分析に精通したアナリストです。
@@ -113,6 +109,8 @@ def start_chat_with_prediction(api_key: str, images):
                 return chat, response.text
             except errors.APIError as e:
                 last_error = e
+                if e.code in MODEL_UNAVAILABLE_CODES:
+                    break  # このモデルは使えないので、次のモデルを試す
                 if e.code not in RETRYABLE_STATUS_CODES:
                     raise
                 if attempt < MAX_RETRIES - 1:
