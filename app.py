@@ -5,7 +5,12 @@ import streamlit as st
 from google import genai
 from google.genai import errors, types
 
-MODEL_CHAIN = ["gemini-3.5-flash", "gemini-3.1-flash-lite"]
+MODEL_CHAIN = [
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
 RETRYABLE_STATUS_CODES = {429, 503}
 MAX_RETRIES = 3
 
@@ -133,7 +138,10 @@ def ask_followup(chat, question: str) -> str:
 
 def show_friendly_error(e: errors.APIError):
     if e.code in RETRYABLE_STATUS_CODES:
-        st.error("AIが混み合っています。少し時間をおいてから、もう一度お試しください。")
+        st.error(
+            f"AIが混み合っています（コード: {e.code}）。"
+            "少し時間をおいてから、もう一度お試しください。"
+        )
     else:
         st.error(f"API呼び出しでエラーが発生しました: {e.code} {e.message}")
 
