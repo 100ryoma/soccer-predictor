@@ -85,11 +85,12 @@ def image_to_part(uploaded_file) -> types.Part:
     return types.Part.from_bytes(data=data, mime_type=mime_type)
 
 
-def build_config() -> types.GenerateContentConfig:
+def build_config(with_search: bool = True) -> types.GenerateContentConfig:
+    tools = [types.Tool(google_search=types.GoogleSearch())] if with_search else None
     return types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         max_output_tokens=4096,
-        tools=[types.Tool(google_search=types.GoogleSearch())],
+        tools=tools,
     )
 
 
@@ -122,10 +123,14 @@ def start_chat_with_prediction(api_key: str, images):
 
 
 def ask_followup(chat, question: str) -> str:
+    # 追加質問では検索を行わず、初回に調べた内容と会話の文脈だけで答える
+    # （検索は上限が別枠で厳しいため、毎回の質問で消費しないようにする）
+    followup_config = build_config(with_search=False)
+
     last_error = None
     for attempt in range(MAX_RETRIES):
         try:
-            response = chat.send_message(question)
+            response = chat.send_message(question, config=followup_config)
             return response.text
         except errors.APIError as e:
             last_error = e
