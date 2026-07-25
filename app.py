@@ -94,21 +94,22 @@ def build_config(with_search: bool = True) -> types.GenerateContentConfig:
     )
 
 
-def start_chat_with_prediction(api_key: str, images):
-    """画像を分析し、以降の会話に使えるChatセッションと初回の回答テキストを返す。"""
-    client = genai.Client(api_key=api_key)
-    config = build_config()
+def generate_with_fallback(api_key: str, contents, config: types.GenerateContentConfig):
+    """MODEL_CHAINを順番に試し、成功したモデル名とレスポンスを返す。
 
-    contents = [image_to_part(f) for f in images]
-    contents.append(USER_PROMPT)
+    毎回新しいClientを作る（Streamlit Cloudでは、セッションをまたいで
+    接続オブジェクトを使い回すと "client has been closed" エラーになるため）。
+    """
+    client = genai.Client(api_key=api_key)
 
     last_error = None
     for model in MODEL_CHAIN:
-        chat = client.chats.create(model=model, config=config)
         for attempt in range(MAX_RETRIES):
             try:
-                response = chat.send_message(contents)
-                return chat, response.text
+                response = client.models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+                return model, response
             except errors.APIError as e:
                 last_error = e
                 if e.code in MODEL_UNAVAILABLE_CODES or e.code in NO_RETRY_STATUS_CODES:
@@ -122,24 +123,35 @@ def start_chat_with_prediction(api_key: str, images):
     raise last_error
 
 
-def ask_followup(chat, question: str) -> str:
+def start_prediction(api_key: str, images):
+    """画像を分析し、以降の会話に使う履歴（history）と初回の回答テキストを返す。"""
+    parts = [image_to_part(f) for f in images]
+    parts.append(types.Part.from_text(text=USER_PROMPT))
+    user_content = types.Content(role="user", parts=parts)
+
+    _, response = generate_with_fallback(
+        api_key, [user_content], build_config(with_search=True)
+    )
+
+    model_content = response.candidates[0].content
+    history = [user_content, model_content]
+    return history, response.text
+
+
+def ask_followup(api_key: str, history, question: str):
+    """これまでの履歴に質問を足して送り、新しい履歴（history）と回答テキストを返す。"""
+    user_content = types.Content(
+        role="user", parts=[types.Part.from_text(text=question)]
+    )
+    contents = history + [user_content]
+
     # 追加質問では検索を行わず、初回に調べた内容と会話の文脈だけで答える
     # （検索は上限が別枠で厳しいため、毎回の質問で消費しないようにする）
-    followup_config = build_config(with_search=False)
+    _, response = generate_with_fallback(api_key, contents, build_config(with_search=False))
 
-    last_error = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = chat.send_message(question, config=followup_config)
-            return response.text
-        except errors.APIError as e:
-            last_error = e
-            if e.code in NO_RETRY_STATUS_CODES:
-                raise  # 上限オーバーは待っても解消しない
-            if e.code not in RETRYABLE_STATUS_CODES or attempt == MAX_RETRIES - 1:
-                raise
-            time.sleep(2**attempt)
-    raise last_error
+    model_content = response.candidates[0].content
+    new_history = contents + [model_content]
+    return new_history, response.text
 
 
 def show_friendly_error(e: errors.APIError):
@@ -158,7 +170,7 @@ def show_friendly_error(e: errors.APIError):
 
 
 def reset_session():
-    for key in ("chat", "messages"):
+    for key in ("history", "messages"):
         st.session_state.pop(key, None)
 
 
@@ -180,7 +192,7 @@ def main():
         )
         return
 
-    if "chat" not in st.session_state:
+    if "history" not in st.session_state:
         uploaded_files = st.file_uploader(
             "試合のライブスタッツ画像をアップロード（複数枚可）",
             type=["png", "jpg", "jpeg"],
@@ -199,12 +211,12 @@ def main():
 
             with st.spinner("AIが試合を分析中...（対戦成績や直近の調子もWeb検索中）"):
                 try:
-                    chat, result = start_chat_with_prediction(api_key, uploaded_files)
+                    history, result = start_prediction(api_key, uploaded_files)
                 except errors.APIError as e:
                     show_friendly_error(e)
                     return
 
-            st.session_state.chat = chat
+            st.session_state.history = history
             st.session_state.messages = [{"role": "assistant", "content": result}]
             st.rerun()
 
@@ -228,11 +240,14 @@ def main():
         with st.chat_message("assistant"):
             with st.spinner("考え中..."):
                 try:
-                    answer = ask_followup(st.session_state.chat, question)
+                    history, answer = ask_followup(
+                        api_key, st.session_state.history, question
+                    )
                 except errors.APIError as e:
                     show_friendly_error(e)
                     return
             st.markdown(answer)
+        st.session_state.history = history
         st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
