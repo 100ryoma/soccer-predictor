@@ -5,9 +5,10 @@ import streamlit as st
 from google import genai
 from google.genai import errors, types
 
-MODEL_CHAIN = ["gemini-3.5-flash", "gemini-3.1-flash-lite"]
+MODEL_CHAIN = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
 RETRYABLE_STATUS_CODES = {429, 503}
 MODEL_UNAVAILABLE_CODES = {404}
+NO_RETRY_STATUS_CODES = {429}  # 上限オーバーは待っても解消しないので、同じモデルではリトライしない
 MAX_RETRIES = 3
 
 SYSTEM_PROMPT = """あなたはサッカーの試合分析に精通したアナリストです。
@@ -109,8 +110,8 @@ def start_chat_with_prediction(api_key: str, images):
                 return chat, response.text
             except errors.APIError as e:
                 last_error = e
-                if e.code in MODEL_UNAVAILABLE_CODES:
-                    break  # このモデルは使えないので、次のモデルを試す
+                if e.code in MODEL_UNAVAILABLE_CODES or e.code in NO_RETRY_STATUS_CODES:
+                    break  # このモデルは使えない/上限オーバーなので、次のモデルを試す
                 if e.code not in RETRYABLE_STATUS_CODES:
                     raise
                 if attempt < MAX_RETRIES - 1:
@@ -128,6 +129,8 @@ def ask_followup(chat, question: str) -> str:
             return response.text
         except errors.APIError as e:
             last_error = e
+            if e.code in NO_RETRY_STATUS_CODES:
+                raise  # 上限オーバーは待っても解消しない
             if e.code not in RETRYABLE_STATUS_CODES or attempt == MAX_RETRIES - 1:
                 raise
             time.sleep(2**attempt)
@@ -135,7 +138,12 @@ def ask_followup(chat, question: str) -> str:
 
 
 def show_friendly_error(e: errors.APIError):
-    if e.code in RETRYABLE_STATUS_CODES:
+    if e.code == 429:
+        st.error(
+            "無料枠の利用上限に達しました（コード: 429）。"
+            "1日の上限は翌日まで回復しません。頻発する場合は開発者に連絡してください。"
+        )
+    elif e.code in RETRYABLE_STATUS_CODES:
         st.error(
             f"AIが混み合っています（コード: {e.code}）。"
             "少し時間をおいてから、もう一度お試しください。"
