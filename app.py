@@ -1,15 +1,27 @@
+import base64
+import json
 import os
 import time
+from datetime import datetime, timedelta, timezone
 
 import streamlit as st
 from google import genai
 from google.genai import errors, types
+from streamlit_local_storage import LocalStorage
 
 MODEL_CHAIN = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
 RETRYABLE_STATUS_CODES = {429, 503}
 MODEL_UNAVAILABLE_CODES = {404}
 NO_RETRY_STATUS_CODES = {429}  # 上限オーバーは待っても解消しないので、同じモデルではリトライしない
 MAX_RETRIES = 3
+
+HISTORY_TTL_DAYS = 3
+STORAGE_KEY_STATE = "soccer_predictor_state"
+STORAGE_KEY_RECORDS = "soccer_predictor_records"
+
+RESULT_CATEGORIES = [
+    "試合展開", "最終スコア", "CK数", "カード", "過去の対戦成績", "直近の調子", "心理状況",
+]
 
 SYSTEM_PROMPT = """あなたはサッカーの試合分析に精通したアナリストです。
 ユーザーから試合の途中経過を示す画像（スコア、経過時間、攻撃回数、危険な攻撃、\
@@ -44,6 +56,12 @@ SYSTEM_PROMPT = """あなたはサッカーの試合分析に精通したアナ�
 初回の回答のあと、ユーザーから「このあとの展開はどうなる？」のような追加の質問が来ることが\
 あります。会話形式で、これまでの文脈を踏まえて答えてください。ただし、賭け金の金額計算や\
 資金配分、軍資金の増やし方についての助言は行わないでください（このアプリの対象外です）。
+
+ユーザーはチャット中に、試合の追加画像（経過報告のスクリーンショットなど）や、\
+ニュース記事・SNS投稿のURLを送ってくることがあります。追加画像が送られたら、その最新の\
+状況を踏まえて回答を更新してください。URLが送られたら、内容を読み取れた場合はそれを踏まえて\
+回答し、読み取れなかった場合は無理に内容を推測せず「このリンクの内容は確認できませんでした」\
+と正直に伝えてください（X（Twitter）など、読み取れないサイトもあります）。
 """
 
 USER_PROMPT = "この試合画像から、指示された7項目を予想してください。"
@@ -85,13 +103,98 @@ def image_to_part(uploaded_file) -> types.Part:
     return types.Part.from_bytes(data=data, mime_type=mime_type)
 
 
-def build_config(with_search: bool = True) -> types.GenerateContentConfig:
-    tools = [types.Tool(google_search=types.GoogleSearch())] if with_search else None
+def build_config(with_search: bool = True, with_url_context: bool = True) -> types.GenerateContentConfig:
+    tools = []
+    if with_search:
+        tools.append(types.Tool(google_search=types.GoogleSearch()))
+    if with_url_context:
+        tools.append(types.Tool(url_context=types.UrlContext()))
     return types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         max_output_tokens=4096,
-        tools=tools,
+        tools=tools or None,
     )
+
+
+# --- 会話履歴のシリアライズ（ブラウザのlocalStorageに保存できる形に変換） ---
+
+
+def content_to_dict(content: types.Content) -> dict:
+    parts = []
+    for p in content.parts:
+        if p.text is not None:
+            parts.append({"type": "text", "text": p.text})
+        elif p.inline_data is not None:
+            parts.append({
+                "type": "image",
+                "mime_type": p.inline_data.mime_type,
+                "data_b64": base64.b64encode(p.inline_data.data).decode("ascii"),
+            })
+        # 検索結果などその他のパートは保存対象外（次回読み込み時は要約テキストのみ復元）
+    return {"role": content.role, "parts": parts}
+
+
+def dict_to_content(d: dict) -> types.Content:
+    parts = []
+    for p in d["parts"]:
+        if p["type"] == "text":
+            parts.append(types.Part.from_text(text=p["text"]))
+        elif p["type"] == "image":
+            parts.append(
+                types.Part.from_bytes(
+                    data=base64.b64decode(p["data_b64"]), mime_type=p["mime_type"]
+                )
+            )
+    return types.Content(role=d["role"], parts=parts)
+
+
+def save_state(storage: LocalStorage, created_at: str):
+    state = {
+        "created_at": created_at,
+        "history": [content_to_dict(c) for c in st.session_state.history],
+        "messages": st.session_state.messages,
+    }
+    storage.setItem(STORAGE_KEY_STATE, json.dumps(state))
+
+
+def load_state(storage: LocalStorage):
+    raw = storage.getItem(STORAGE_KEY_STATE)
+    if not raw:
+        return None
+    try:
+        state = json.loads(raw)
+        created_at = datetime.fromisoformat(state["created_at"])
+        if datetime.now(timezone.utc) - created_at > timedelta(days=HISTORY_TTL_DAYS):
+            return None
+        state["history"] = [dict_to_content(c) for c in state["history"]]
+        return state
+    except Exception:
+        return None
+
+
+def clear_state(storage: LocalStorage):
+    if storage.getItem(STORAGE_KEY_STATE) is not None:
+        storage.deleteItem(STORAGE_KEY_STATE)
+
+
+# --- 的中/非的中の記録 ---
+
+
+def load_records(storage: LocalStorage) -> list:
+    raw = storage.getItem(STORAGE_KEY_RECORDS)
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except Exception:
+        return []
+
+
+def save_records(storage: LocalStorage, records: list):
+    storage.setItem(STORAGE_KEY_RECORDS, json.dumps(records))
+
+
+# --- Gemini呼び出し ---
 
 
 def generate_with_fallback(api_key: str, contents, config: types.GenerateContentConfig):
@@ -130,7 +233,7 @@ def start_prediction(api_key: str, images):
     user_content = types.Content(role="user", parts=parts)
 
     _, response = generate_with_fallback(
-        api_key, [user_content], build_config(with_search=True)
+        api_key, [user_content], build_config(with_search=True, with_url_context=True)
     )
 
     model_content = response.candidates[0].content
@@ -138,16 +241,18 @@ def start_prediction(api_key: str, images):
     return history, response.text
 
 
-def ask_followup(api_key: str, history, question: str):
-    """これまでの履歴に質問を足して送り、新しい履歴（history）と回答テキストを返す。"""
-    user_content = types.Content(
-        role="user", parts=[types.Part.from_text(text=question)]
-    )
+def ask_followup(api_key: str, history, question: str, images=None):
+    """これまでの履歴に質問（＋任意の画像）を足して送り、新しいhistoryと回答テキストを返す。"""
+    parts = [image_to_part(f) for f in (images or [])]
+    parts.append(types.Part.from_text(text=question or "（画像を送りました）"))
+    user_content = types.Content(role="user", parts=parts)
     contents = history + [user_content]
 
-    # 追加質問では検索を行わず、初回に調べた内容と会話の文脈だけで答える
-    # （検索は上限が別枠で厳しいため、毎回の質問で消費しないようにする）
-    _, response = generate_with_fallback(api_key, contents, build_config(with_search=False))
+    # 追加質問では検索は行わない（検索は上限が別枠で厳しいため）が、
+    # ユーザーが貼ったURLの内容は読み取れるようにしておく
+    _, response = generate_with_fallback(
+        api_key, contents, build_config(with_search=False, with_url_context=True)
+    )
 
     model_content = response.candidates[0].content
     new_history = contents + [model_content]
@@ -169,8 +274,40 @@ def show_friendly_error(e: errors.APIError):
         st.error(f"API呼び出しでエラーが発生しました: {e.code} {e.message}")
 
 
-def reset_session():
-    for key in ("history", "messages"):
+def render_result_recorder(storage: LocalStorage):
+    with st.expander("🏁 試合結果を記録する（的中/非的中）"):
+        with st.form("result_form", clear_on_submit=True):
+            correct = st.multiselect("的中した項目を選んでください", RESULT_CATEGORIES)
+            note = st.text_area("メモ（実際のスコアなど、任意）", height=80)
+            submitted = st.form_submit_button("記録する")
+            if submitted:
+                records = load_records(storage)
+                records.append(
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "correct_categories": correct,
+                        "note": note,
+                    }
+                )
+                save_records(storage, records)
+                st.success("記録しました。")
+
+        records = load_records(storage)
+        if records:
+            st.markdown(f"**これまでの記録：{len(records)}件**")
+            counts = {c: 0 for c in RESULT_CATEGORIES}
+            for r in records:
+                for c in r.get("correct_categories", []):
+                    if c in counts:
+                        counts[c] += 1
+            cols = st.columns(len(RESULT_CATEGORIES))
+            for col, category in zip(cols, RESULT_CATEGORIES):
+                col.metric(category, f"{counts[category]}/{len(records)}")
+
+
+def reset_session(storage: LocalStorage):
+    clear_state(storage)
+    for key in ("history", "messages", "created_at"):
         st.session_state.pop(key, None)
 
 
@@ -191,6 +328,15 @@ def main():
             "GEMINI_API_KEYを設定してください（開発者向けのメッセージです）。"
         )
         return
+
+    storage = LocalStorage()
+
+    if "history" not in st.session_state:
+        restored = load_state(storage)
+        if restored:
+            st.session_state.history = restored["history"]
+            st.session_state.messages = restored["messages"]
+            st.session_state.created_at = restored["created_at"]
 
     if "history" not in st.session_state:
         uploaded_files = st.file_uploader(
@@ -218,30 +364,53 @@ def main():
 
             st.session_state.history = history
             st.session_state.messages = [{"role": "assistant", "content": result}]
+            st.session_state.created_at = datetime.now(timezone.utc).isoformat()
+            save_state(storage, st.session_state.created_at)
             st.rerun()
 
         return
 
     # ここから下は、初回の予想が終わった後の会話画面
     if st.button("新しい試合で始める"):
-        reset_session()
+        reset_session(storage)
         st.rerun()
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
+            for img_b64 in message.get("images", []):
+                st.image(base64.b64decode(img_b64), width=200)
             st.markdown(message["content"])
 
-    question = st.chat_input("試合について追加で質問する（例：このあとの展開は？）")
-    if question:
-        st.session_state.messages.append({"role": "user", "content": question})
+    render_result_recorder(storage)
+
+    chat_value = st.chat_input(
+        "試合について追加で質問する（画像やURLも送れます）",
+        accept_file="multiple",
+        file_type=["png", "jpg", "jpeg"],
+    )
+    if chat_value:
+        question = chat_value.text
+        images = chat_value.files
+
+        image_b64_list = []
+        for f in images:
+            data = f.read()
+            image_b64_list.append(base64.b64encode(data).decode("ascii"))
+            f.seek(0)
+
+        st.session_state.messages.append(
+            {"role": "user", "content": question, "images": image_b64_list}
+        )
         with st.chat_message("user"):
+            for img_b64 in image_b64_list:
+                st.image(base64.b64decode(img_b64), width=200)
             st.markdown(question)
 
         with st.chat_message("assistant"):
             with st.spinner("考え中..."):
                 try:
                     history, answer = ask_followup(
-                        api_key, st.session_state.history, question
+                        api_key, st.session_state.history, question, images
                     )
                 except errors.APIError as e:
                     show_friendly_error(e)
@@ -249,6 +418,7 @@ def main():
             st.markdown(answer)
         st.session_state.history = history
         st.session_state.messages.append({"role": "assistant", "content": answer})
+        save_state(storage, st.session_state.created_at)
 
 
 if __name__ == "__main__":
